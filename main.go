@@ -20,8 +20,10 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/sky-cloud-tec/netd/api/routers"
 	"github.com/sky-cloud-tec/netd/common"
 	"github.com/sky-cloud-tec/netd/ingress"
 
@@ -40,6 +42,11 @@ func init() {
 	appConfig = &AppConfig{
 		logCfg: &common.LogConfig{},
 	}
+	if common.AppConfigInstance == nil {
+		common.AppConfigInstance = &common.AppConfig{
+			Confidence: 30,
+		}
+	}
 }
 
 func initLogger() error {
@@ -57,6 +64,12 @@ func jrpcHandler(c *cli.Context) error {
 	if err := initLogger(); err != nil {
 		return err
 	}
+	go func() {
+		if err := routers.SetupRouter(c.String("api-addr")).Run(c.String("api-addr")); err != nil {
+			panic(err)
+		}
+	}()
+	common.AppConfigInstance.LogCfgDir = strings.TrimSuffix(common.AppConfigInstance.LogCfgDir, "/")
 	// init jrpc
 	jrpc, _ := ingress.NewJrpc(c.String("addr"))
 	jrpc.Register(new(ingress.CliHandler))
@@ -91,7 +104,37 @@ func main() {
 					Value: "0.0.0.0:8188", // default port 8188
 					Usage: "jprc listen address",
 				},
+				cli.StringFlag{
+					Name:  "api-address, api-addr",
+					Value: "0.0.0.0:8189",
+					Usage: "api listen address",
+				},
+				cli.IntFlag{
+					Name:        "confidence, ce",
+					Value:       30,
+					Usage:       "encoding convert confidence",
+					Required:    false,
+					Destination: &common.AppConfigInstance.Confidence,
+				},
+				cli.IntFlag{
+					Name:        "log-cfg-flag, lcf",
+					Value:       0, // false
+					Usage:       "write command output cfg to file as binary",
+					Required:    false,
+					Destination: &common.AppConfigInstance.LogCfgFlag,
+				},
+				cli.StringFlag{
+					Name:        "log-cfg-dir, lcd",
+					Value:       "/var/log/netd",
+					Required:    false,
+					Destination: &common.AppConfigInstance.LogCfgDir,
+				},
 			},
+		},
+		{
+			Name:    "hotfix",
+			Aliases: []string{"hotfix"},
+			Usage:   "Run hotfix cli to fix regex patterns online\n\t\t\tplease note, fixed pattern will lost when netd restart.",
 		},
 	}
 

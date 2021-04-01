@@ -39,8 +39,8 @@ type opTopSec struct {
 }
 
 func createOpTopSec() cli.Operator {
-	loginPrompt := regexp.MustCompile("[[:alnum:]]{1,}[-_[:alnum:]]{0,}# $")
-	loginPrompt2 := regexp.MustCompile("[[:alnum:]]{1,}[-_[:alnum:]]{0,}% $")
+	loginPrompt := regexp.MustCompile(`[[:alnum:]]{1,}[-_\[\][:alnum:]]{0,}# $`)
+	loginPrompt2 := regexp.MustCompile(`[[:alnum:]]{1,}[-_\[\][:alnum:]]{0,}% $`)
 	return &opTopSec{
 		transitions: map[string][]string{},
 		prompts: map[string][]*regexp.Regexp{
@@ -50,7 +50,7 @@ func createOpTopSec() cli.Operator {
 			regexp.MustCompile("^error"),
 		},
 		lineBeak:     "\n",
-		encodingType: "GBK",
+		encodingType: "ISO-8859-1",
 	}
 }
 
@@ -59,6 +59,14 @@ func (s *opTopSec) GetPrompts(k string) []*regexp.Regexp {
 		return v
 	}
 	return nil
+}
+
+func (s *opTopSec) SetPrompts(k string, regs []*regexp.Regexp) {
+	s.prompts[k] = regs
+}
+
+func (s *opTopSec) SetErrPatterns(regs []*regexp.Regexp) {
+	s.errs = regs
 }
 
 func (s *opTopSec) GetExcludes() []*regexp.Regexp {

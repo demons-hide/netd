@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/ziutek/telnet"
+	"strconv"
 )
 
 var (
@@ -100,12 +102,12 @@ func Acquire(req *protocol.CliRequest, op cli.Operator) (*CliConn, error) {
 			// use exist conn
 			v.req = req
 			v.op = op
-			logs.Info(req.LogPrefix, "cli conn exist")
+			logs.Info(req.LogPrefix, "user", req.Auth.Username, "cli conn exist")
 			return v, nil
 		}
 		// new user
 		if v.req.Auth.Username != req.Auth.Username {
-			logs.Info(req.LogPrefix, "drop", v.req.Auth.Username, "pick", req.Auth.Username)
+			logs.Info(req.LogPrefix, "drop user", v.req.Auth.Username, "pick", req.Auth.Username)
 		}
 		// or new protocol
 		if v.req.Protocol != req.Protocol {
@@ -160,19 +162,26 @@ func newCliConn(req *protocol.CliRequest, op cli.Operator) (*CliConn, error) {
 		if err != nil {
 			return nil, fmt.Errorf("dial %s error: %s", req.Address, err)
 		}
-		e := regexp.MustCompile("Error: ")
-		p := regexp.MustCompile("Username:$")
-		_, err = cli.ReadStringUntilError(conn, p, e)
-		if err != nil {
-			return nil, fmt.Errorf("telnet ReadStringUntil error: %s", err)
+
+		if common.AppConfigInstance.LogCfgFlag == 3 {
+			e := regexp.MustCompile("Error: ")
+			p := regexp.MustCompile("login: $")
+			_, err = cli.ReadStringUntilError(conn, p, e)
+			if err != nil {
+				return nil, fmt.Errorf("telnet ReadStringUntil error: %s", err)
+			}
+			conn.Write([]byte(req.Auth.Username + "\r"))
+			p = regexp.MustCompile("Password: $")
+			_, err = cli.ReadStringUntilError(conn, p, e)
+			if err != nil {
+				return nil, fmt.Errorf("telnet ReadStringUntil error: %s", err)
+			}
+			conn.Write([]byte(req.Auth.Password + "\r"))
+		} else if common.AppConfigInstance.LogCfgFlag == 4 {
+			if _, err := conn.Write([]byte(req.Auth.Username + "\r" + req.Auth.Password + "\r")); err != nil {
+				return nil, fmt.Errorf("auth error %s", err)
+			}
 		}
-		conn.Write([]byte(req.Auth.Username + "\r"))
-		p = regexp.MustCompile("Password:$")
-		_, err = cli.ReadStringUntilError(conn, p, e)
-		if err != nil {
-			return nil, fmt.Errorf("telnet ReadStringUntil error: %s", err)
-		}
-		conn.Write([]byte(req.Auth.Password + "\r"))
 
 		c := &CliConn{t: common.TELNETConn, conn: conn, req: req, op: op, mode: op.GetStartMode()}
 		if err := c.init(); err != nil {
@@ -197,7 +206,7 @@ func (s *CliConn) heartbeat() {
 				logs.Info(s.req.LogPrefix, "Acquiring heartbeat sema...")
 				semas[s.req.Address] <- struct{}{}
 				logs.Info(s.req.LogPrefix, "heartbeat sema acquired")
-				if _, err := s.writeBuff(""); err != nil {
+				if _, err := s.writeBuff(" "); err != nil {
 					logs.Critical(s.req.LogPrefix, "heartbeat error:", err)
 					if err1 := s.Close(); err1 != nil {
 						logs.Error(s.req.LogPrefix, "close conn err", err1)
@@ -309,6 +318,7 @@ func (s *CliConn) init() error {
 }
 
 func (s *CliConn) closePage(drain bool) error {
+	logs.Info(s.req.LogPrefix, "closing page ...")
 	if strings.EqualFold(s.req.Vendor, "cisco") && (strings.EqualFold(s.req.Type, "asa") || strings.EqualFold(s.req.Type, "asav")) {
 		// login mode no close page
 		if s.mode == "login" {
@@ -354,28 +364,34 @@ func (s *CliConn) closePage(drain bool) error {
 			return err
 		}
 	} else if strings.EqualFold(s.req.Vendor, "huawei") {
-		if s.mode == "login" {
-			// current in login mode
-			// enter system view
-			s.mode = "system_View"
-			if _, err := s.writeBuff("system-view"); err != nil {
-				// rollback
-				s.mode = "login"
+		if strings.HasSuffix(s.req.Version, "200") {
+			if _, err := s.writeBuff("screen-length 0 temporary"); err != nil {
 				return err
 			}
-			// drain output
-			if _, _, err := s.readBuff(); err != nil {
+		} else {
+			if s.mode == "login" {
+				// current in login mode
+				// enter system view
+				s.mode = "system_View"
+				if _, err := s.writeBuff("system-view"); err != nil {
+					// rollback
+					s.mode = "login"
+					return err
+				}
+				// drain output
+				if _, _, err := s.readBuff(); err != nil {
+					return err
+				}
+				// after disable more scren, no need to transition back to login mode
+				// it wiil be done automaticaly before execute commands
+			}
+			// now in system view
+			cmd := "user-interface current\nscreen-length 0"
+			// quit from ui config
+			cmd += "\nquit"
+			if _, err := s.writeBuff(cmd); err != nil {
 				return err
 			}
-			// after disable more scren, no need to transition back to login mode
-			// it wiil be done automaticaly before execute commands
-		}
-		// now in system view
-		cmd := "user-interface current\nscreen-length 0"
-		// quit from ui config
-		cmd += "\nquit"
-		if _, err := s.writeBuff(cmd); err != nil {
-			return err
 		}
 		// drain output. see following lines
 	} else {
@@ -389,6 +405,7 @@ func (s *CliConn) closePage(drain bool) error {
 	if _, _, err := s.readBuff(); err != nil {
 		return err
 	}
+	logs.Info(s.req.LogPrefix, "closing page done")
 	return nil
 }
 
@@ -426,6 +443,13 @@ func (s *CliConn) read(buff []byte) (int, error) {
 	return s.conn.Read(buff)
 }
 
+func (s *CliConn) readFull(buf []byte) (int, error) {
+	if s.t == common.SSHConn {
+		return io.ReadFull(s.r, buf)
+	}
+	return io.ReadFull(s.conn, buf)
+}
+
 func (s *CliConn) write(b []byte) (int, error) {
 	if s.t == common.SSHConn {
 		return s.w.Write(b)
@@ -450,16 +474,46 @@ func (s *CliConn) anyMatch(t string, patterns []*regexp.Regexp) []string {
 	return nil
 }
 
+func (s *CliConn) writeLogFile(b []byte, path string) error {
+	if len(b) < 1 {
+		return nil
+	}
+	if common.AppConfigInstance.LogCfgFlag > 0 {
+		// openfile for writing session output
+		if _, err := os.Stat(path); err == nil {
+			// exists
+			// DO NOT Write
+
+		} else if os.IsNotExist(err) {
+			// does *not* exist
+			// write
+			f, err := os.Create(path)
+			if err != nil {
+				return err
+			}
+			f.Write(b)
+			defer f.Close()
+
+		} else {
+			logs.Error(s.req.LogPrefix, err)
+		}
+	}
+	return nil
+}
+
 func (s *CliConn) readLines() *readBuffOut {
 	buf := make([]byte, 1000)
 	var (
-		waitingString, lastLine string
-		errRes                  error
-		wbuf                    bytes.Buffer
+		lastLine string
+		errRes   error
+		wbuf     bytes.Buffer
+		f        *os.File
+		err      error
 	)
+
 outside:
 	for {
-		n, err := s.read(buf) //this reads the ssh/telnet terminal
+		n, err := s.read(buf) // read ssh/telnet terminal content from session/conn
 		if err != nil {
 			// something wrong
 			logs.Error(s.req.LogPrefix, "io.Reader read error:", err)
@@ -470,6 +524,14 @@ outside:
 		// print received content
 		logs.Debug(s.req.LogPrefix, "(", n, ")", string(buf[:n]))
 
+		// write binary to file
+		if f != nil {
+			if _, err = f.Write(buf[:n]); err != nil {
+				errRes = err
+				break
+			}
+		}
+
 		// write received content to whole document buffer
 		wbuf.Write(buf[:n])
 		// slice alias
@@ -477,14 +539,24 @@ outside:
 
 		// reverse traversal
 		// traverse lastline
-		var lineBeginAt int
+		lineBeginAt := -1
 		for i := wbuf.Len() - 1; i >= 0; i-- {
 			if rbuf[i] == '\n' || rbuf[i] == '\r' {
 				lineBeginAt = i
 				break
 			}
 		}
-		testee := string(rbuf[lineBeginAt:])
+		var testee string
+		if lineBeginAt == -1 {
+			// no newline for now
+			// xxx
+			// {prompt}
+			testee = string(rbuf)
+		} else {
+			// \nxxx
+			// \n{prompt}
+			testee = string(rbuf[lineBeginAt:])
+		}
 
 		// check --More--
 		// there are several cases when you check
@@ -495,9 +567,10 @@ outside:
 		if cli.IsSymmetricalMore(testee) {
 			// remove these bytes from wbuf
 			// DO NOT EAT LINEBREAK
-			wbuf.Truncate(lineBeginAt + 1)
-			// press enter
-			if _, err := s.writeBuff(""); err != nil {
+			// wbuf.Truncate(lineBeginAt + 1) // lineBeginAt could not be -1
+			// or deal with this when output done
+			// press enter or press space
+			if _, err := s.writeBuff(" "); err != nil {
 				logs.Error(s.req.LogPrefix, "press enter error:", err)
 				errRes = err
 				break outside
@@ -515,43 +588,16 @@ outside:
 
 		if len(matches) > 0 && !cli.AnyMatch(s.op.GetExcludes(), testee) {
 			// test pass
-			logs.Info(s.req.LogPrefix, "prompt matched", s.mode, ":", matches)
-			// ignore prompt and break
-			if lineBeginAt == 0 {
+			logs.Info(s.req.LogPrefix, "prompt matched --->", s.mode, ":", matches)
+			// truncate prompt and break
+			if lineBeginAt == -1 {
 				lastLine = testee
 			} else {
 				// newline not include
+				// \n not include but \r may include for windows linebreak
 				lastLine = string(rbuf[lineBeginAt+1:])
-				// \n not include but \r maybe include in windows linebreak
-				d := chardet.NewTextDetector()
-				dr, err := d.DetectBest(rbuf[:lineBeginAt])
-				if err != nil {
-					logs.Error(s.req.LogPrefix, "detect origin encoding error:", err)
-				}
-				// print origin encoding
-				logs.Debug(s.req.LogPrefix, "detected encoding", dr, "predefined encoding", s.op.GetEncoding())
-
-				encoding := s.op.GetEncoding()
-				if dr != nil && dr.Charset != "UTF-8" && dr.Confidence > 90 {
-					// predefined encoding may set wrong
-					encoding = dr.Charset
-				}
-				// convert, even if detect error
-				// if not converted, original byte slice will be retured
-				u8buf, err := common.ConvToUTF8(encoding, rbuf[:lineBeginAt])
-				if err != nil {
-					logs.Error(s.req.LogPrefix, "conv to utf8 error:", err)
-					waitingString = string(rbuf[:lineBeginAt])
-				} else {
-					// conv ok, compare size then log
-					logs.Debug(s.req.LogPrefix, "origin size", len(rbuf[:lineBeginAt]), "converted size", len(u8buf))
-					// dectect again
-					dr, err = d.DetectBest(u8buf)
-					logs.Debug(s.req.LogPrefix, "detected encoding after converting", dr, err)
-					// use converted content
-					waitingString = string(u8buf)
-				}
 			}
+			wbuf.Truncate(lineBeginAt + 1)
 			// break the out loop
 			break outside
 		}
@@ -563,11 +609,85 @@ outside:
 			buf = make([]byte, 2*n)
 		}
 	}
+
+	path := common.AppConfigInstance.LogCfgDir + "/" + s.req.Session + ".binary.cfg.raw." + strconv.Itoa(wbuf.Len())
+	if err := s.writeLogFile(wbuf.Bytes(), path); err != nil {
+		return &readBuffOut{
+			err,
+			"",
+			"",
+		}
+	}
+	d := chardet.NewTextDetector()
+	dr, err := d.DetectBest(wbuf.Bytes())
+	if err != nil {
+		logs.Error(s.req.LogPrefix, "detect origin encoding error:", err)
+	}
+	// print origin encoding
+	logs.Debug(s.req.LogPrefix, "detected encoding", dr, "predefined encoding", s.op.GetEncoding())
+
+	encoding := s.op.GetEncoding()
+	if dr != nil && dr.Charset != "UTF-8" && dr.Confidence >= common.AppConfigInstance.Confidence {
+		// predefined encoding may set wrong
+		encoding = dr.Charset
+	}
+	// convert, even if detect error
+	// if not converted, original byte slice will be retured
+	u8buf, err := common.ConvToUTF8(encoding, wbuf.Bytes())
+	if err != nil {
+		logs.Error(s.req.LogPrefix, "conv to utf8 error:", err)
+	} else {
+		// conv ok, compare size then log
+		logs.Debug(s.req.LogPrefix, "origin size", wbuf.Len(), "converted size", len(u8buf))
+		// dectect again
+		dr, err = d.DetectBest(u8buf)
+		logs.Debug(s.req.LogPrefix, "detected encoding after converting", dr, err)
+		// use converted content
+	}
+
+	// replace more
+	y := string(u8buf)
+	x := y
+	if strings.EqualFold(s.req.Vendor, "fortinet") {
+		x = removeMoreBreakedPart(removeWinBlankline1Space(removeWinBlankline5Space(removeStandardMore(string(y)))))
+	}
+	path1 := common.AppConfigInstance.LogCfgDir + "/" + s.req.Session + ".binary.cfg.str." + strconv.Itoa(len(x))
+	if err := s.writeLogFile([]byte(x), path1); err != nil {
+		return &readBuffOut{
+			err,
+			"",
+			"",
+		}
+	}
+	// debug code end
 	return &readBuffOut{
 		errRes,
-		waitingString,
+		x,
 		lastLine,
 	}
+}
+
+func removeWinLinebreak(x string) string {
+	return regexp.MustCompile(`\r\n`).ReplaceAllString(x, "\n")
+}
+
+func removeStandardMore(x string) string {
+	return regexp.MustCompile(`--More--([ ]+\r){1,2}`).ReplaceAllString(x, "")
+}
+
+func removeMoreBreakedPart(x string) string {
+	return regexp.MustCompile(`\n\r( )+\r`).ReplaceAllString(x, "")
+}
+
+func removeWinBlankline5Space(x string) string {
+	return regexp.MustCompile(`( ){5}\r\n`).ReplaceAllString(x, "    ")
+}
+func removeWinBlankline1Space(x string) string {
+	return regexp.MustCompile(` \r\n`).ReplaceAllString(x, "")
+}
+
+func removeBlankline(x string) string {
+	return regexp.MustCompile(`( )+\n`).ReplaceAllString(x, "    ")
 }
 
 // return cmd output, prompt, error
@@ -586,8 +706,8 @@ func (s *CliConn) readBuff() (string, string, error) {
 			for scanner.Scan() {
 				matches := s.anyMatch(scanner.Text(), s.op.GetErrPatterns())
 				if len(matches) > 0 {
-					logs.Info(s.req.LogPrefix, "err pattern matched,", res.ret)
-					return "", res.prompt, fmt.Errorf("err pattern matched, %s", res.ret)
+					logs.Info(s.req.LogPrefix, "err pattern matched:", res.ret)
+					return "", res.prompt, fmt.Errorf("err pattern matched: %s", res.ret)
 				}
 			}
 		}
@@ -599,6 +719,7 @@ func (s *CliConn) readBuff() (string, string, error) {
 
 func (s *CliConn) writeBuff(cmd string) (int, error) {
 	if len(cmd) > 0 && cmd[len(cmd)-1] == '\n' {
+		// linebreaked
 		return s.write([]byte(cmd))
 	}
 	return s.write([]byte(cmd + s.op.GetLinebreak()))

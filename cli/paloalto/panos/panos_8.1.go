@@ -27,7 +27,7 @@ import (
 
 func init() {
 	// register paloalto
-	cli.OperatorManagerInstance.Register(`(?i)paloalto\.pan-os\..*`, createOpPaloalto())
+	cli.OperatorManagerInstance.Register(`(?i)paloalto\.(pan-os|Panorama)\..*`, createOpPaloalto())
 }
 
 type opPaloalto struct {
@@ -70,6 +70,13 @@ func (s *opPaloalto) GetPrompts(k string) []*regexp.Regexp {
 		return v
 	}
 	return nil
+}
+func (s *opPaloalto) SetPrompts(k string, regs []*regexp.Regexp) {
+	s.prompts[k] = regs
+}
+
+func (s *opPaloalto) SetErrPatterns(regs []*regexp.Regexp) {
+	s.errs = regs
 }
 
 func (s *opPaloalto) GetEncoding() string {
